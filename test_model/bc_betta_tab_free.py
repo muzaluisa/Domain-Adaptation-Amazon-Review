@@ -8,6 +8,10 @@ Simple hierarchical sentence model
 import csv
 import torch
 import torch.nn as nn
+if torch.cuda.is_available():
+    import torch.cuda as t
+else:
+    import torch as t
 import torchvision.transforms as transforms
 from torch.autograd import Variable
 import numpy as np
@@ -24,21 +28,28 @@ from collections import Counter
 from nltk.corpus import stopwords
 stopWords = set(stopwords.words('english'))
 
-
 parser = argparse.ArgumentParser(description='Hierarchical alpha model')
-parser.add_argument('-data-folder', type=str, default='/homeappl/home/sayfull1/NYC', help='directory of the book corpus [default: /homeappl/home/sayfull1/NYC]')
 parser.add_argument('-batch-size', type=int, default=64, help = 'batch size [default: 1]')
-parser.add_argument('-epochs', type=int, default=5000, help='number of epochs [default: 10]')
+parser.add_argument('-epochs', type=int, default=15000, help='number of epochs [default: 10]')
 parser.add_argument('-dropout', type=float, default=0.2, help="dropout [default=0.5]")
 parser.add_argument('-lr', type=float, default=0.001, help="learning rate [default=0.001]")
 parser.add_argument('-hidden-size', type=int, default=200, help="the size of the sentence representations")
-parser.add_argument('-K', type=int, default=1, help="the number of sentence representations [default=3]")
+parser.add_argument('-K', type=int, default=3, help="the number of sentence representations [default=3]")
 parser.add_argument('-optimizer', type=str, default='Adam', help="the name of the optimizator [default=Adam]")
-parser.add_argument('-save-model', type=bool, default=False, help='wheather to save .pkl file of the model')
+parser.add_argument('-save-model', type=bool, default=False, help='whether to save .pkl file of the model')
+parser.add_argument('-learn-embedding', type=bool, default=True, help='whether to train the weights of the Glove embeddings')
+parser.add_argument('-stop-words',type=bool,default=False, help='whether to use stop words, [default=False]')
+parser.add_argument('-use-word-embedding', type=bool, default=True, help='whether to use pretrained word embeddings')
+parser.add_argument('-decoder-form', type=str, default="CONCATENATED_LINEAR", help='how to combine the outputs of the decoder: MEAN or CONCATENATED_LINEAR, [default=CONCATENATED_LINEAR]')
+
+#parser.add_argument('-data-folder', type=str, default='.', help='directory of the book corpus')
+
 args = parser.parse_args()
 print args
 
-bc = BookCorpus(args.data_folder, small_dataset=False)
+data_folder = '/homeappl/home/sayfull1/NYC'
+bc = BookCorpus(data_folder, small_dataset=False,\
+stop_words=args.stop_words, train_sentences=30000, max_voc=20000)
 batch_size = args.batch_size
 embed_matrix = bc.embed_matrix
 Xtrain, Lenseq, Xtrain_ind = bc.get_data_with_word_indices(bc.Xtrain)
@@ -60,7 +71,7 @@ num_words = np.shape(Xtrain_np)[1]
 input_size = dim
 hidden_size = args.hidden_size
 num_layers = args.K
-voc_size = len(bc.vocabulary)
+voc_size = len(bc.vocabulary_set)
 lr = args.lr
 
 
@@ -86,8 +97,8 @@ class HierarchicalSent(nn.Module):
             The axes semantics are (num_layers, minibatch_size, hidden_dim)
         '''
 
-        return (Variable(torch.zeros(self.num_layers, batch_size_, self.hidden_size).cuda()),
-                Variable(torch.zeros(self.num_layers, batch_size_, self.hidden_size).cuda()))
+        return (Variable(t.zeros(self.num_layers, batch_size_, self.hidden_size)),
+                Variable(t.zeros(self.num_layers, batch_size_, self.hidden_size)))
 
     def __init__(self):
 
@@ -97,7 +108,7 @@ class HierarchicalSent(nn.Module):
         self.K = args.K # number of hidden sentence representations, including bag of embeddings
         self.embed = nn.Embedding(voc_size, dim)
 	
-	self.decoder_form = "CONCATENATED_LINEAR" # "CONCATENATED_LINEAR", "RNN"
+	self.decoder_form = args.decoder_form  # "CONCATENATED_LINEAR", "RNN"
         self.enc = nn.ModuleList()
         self.enc.append(nn.Linear(dim, self.hidden_size))
 
@@ -110,20 +121,29 @@ class HierarchicalSent(nn.Module):
 	self.output1 = nn.Linear((self.K+1)*dim, voc_size)
 	self.out_lstm = nn.Linear(2*dim, voc_size)
 	self.dec_lstm = nn.LSTM(dim, dim)
-        for i in range(self.K-1):
+        for i in range(self.K):
                 self.dec.append(nn.Linear(self.hidden_size, voc_size))
-        self.embed.weight.data = torch.from_numpy(np.array(embed_matrix, dtype=np.float32))
+
+	if args.use_word_embedding:
+        	self.embed.weight.data = torch.from_numpy(np.array(embed_matrix, dtype=np.float32))
+        
+	self.embed.weight.requires_grad = False
 
     def forward(self, x, offsets):
 
-        dtype = torch.cuda.FloatTensor
+        dtype = t.FloatTensor
         h = []
         h.append(torch.mean(self.embed(x), dim=1))
         abs_offsets = map(abs, offsets)
 	abs_offsets = map(lambda x: x+1, abs_offsets)
 	num_batch = x.size()[0]
-	abs_offsets_tensor = torch.from_numpy(np.array(abs_offsets, dtype=np.float32)).cuda().unsqueeze(1).expand(num_batch,voc_size)
+	
+        if torch.cuda.is_available():
+            abs_offsets_tensor = torch.from_numpy(np.array(abs_offsets, dtype=np.float32)).cuda().unsqueeze(1).expand(num_batch,voc_size)
+	else:
+	    abs_offsets_tensor = torch.from_numpy(np.array(abs_offsets, dtype=np.float32)).unsqueeze(1).expand(num_batch,voc_size)
 	#print type(abs_offsets_tensor)
+
         # just encode on all levels and then take what is needed only
         for i in range(self.K):
             if i == 0:
@@ -193,8 +213,12 @@ class HierarchicalSent(nn.Module):
         '''
         
         h = []
-        word_idx_array = Variable(torch.from_numpy(word_idx_array_np)).cuda()
-        
+	
+	if torch.cuda.is_available():
+            word_idx_array = Variable(torch.from_numpy(word_idx_array_np)).cuda()
+        else:
+	    word_idx_array = Variable(torch.from_numpy(word_idx_array_np))
+
         h.append(torch.mean(self.embed(word_idx_array), dim=1))
         abs_offsets = map(abs, offsets)
         for i in range(K):
@@ -215,16 +239,19 @@ epochs_new_lr = 0
 train_loss_avg = 0
 
 hs = HierarchicalSent()
-hs.cuda()
+if torch.cuda.is_available():
+    hs.cuda()
+
+parameters = filter(lambda p: p.requires_grad, hs.parameters())
 
 if args.optimizer == "Adadelta":
-   optimizer = torch.optim.Adadelta(hs.parameters(), lr=lr, rho=0.9)
+   optimizer = torch.optim.Adadelta(parameters, lr=lr, rho=0.9)
 
 if args.optimizer == "SGD":
-    optimizer = torch.optim.SGD(hs.parameters(), lr=0.01, momentum=0.9)
+    optimizer = torch.optim.SGD(parameters, lr=0.01, momentum=0.9)
 
 if args.optimizer == "Adam":
-    optimizer =  torch.optim.Adam(hs.parameters(), lr=lr)
+    optimizer =  torch.optim.Adam(parameters, lr=lr)
 
 model_saved = False
 sampled_x = []
@@ -252,34 +279,41 @@ for epoch in range(args.epochs):
 
     sampled_x.extend(x_ind)
     all_offsets.extend(offsets)
-    sentence = Variable(Xtrain[x_ind, :]).cuda()
-    neighbour = Variable(Xtrain[(x_ind + offsets), :]).cuda()
+
+    if torch.cuda.is_available():
+        sentence = Variable(Xtrain[x_ind, :]).cuda()
+        neighbour = Variable(Xtrain[(x_ind + offsets), :]).cuda()
+    else:
+	sentence = Variable(Xtrain[x_ind, :])
+        neighbour = Variable(Xtrain[(x_ind + offsets), :])
 
     outputs = hs(sentence, offsets)
 
-    if np.random.randint(0,100) == 5:
-        print 'sampled sentence:', bc.Xtrain[Xtrain_ind[x_pos]]
-        print 'sampled neighbour sentence:', bc.Xtrain[Xtrain_ind[x_pos + offset]]
-        print 'offset:', offset
-	print 'output probs:', outputs.data.cpu().numpy()
-        probs , indices = torch.sort(outputs, dim=1, descending=True)
-        indices_np = indices.data.cpu().numpy()
-        probs_np = probs.data.cpu().numpy()
-        most_prob_words = []
-        for index in indices_np[0][0:100]:
-            most_prob_words.append(bc.vocabulary[index])
-
-        print "with stop words: ", " ".join(most_prob_words)
-   
+    '''if np.random.randint(0,100) == 5:
+	try:
+            print 'sampled sentence:', bc.Xtrain[Xtrain_ind[x_pos]]
+            print 'sampled neighbour sentence:', bc.Xtrain[Xtrain_ind[x_pos + offset]]
+            print 'offset:', offset
+	    print 'output probs:', outputs.data.cpu().numpy()
+            probs , indices = torch.sort(outputs, dim=1, descending=True)
+            indices_np = indices.data.cpu().numpy()
+            probs_np = probs.data.cpu().numpy()
+            most_prob_words = []
+            for index in indices_np[0][0:100]:
+                most_prob_words.append(bc.vocabulary[index])
+            print "with stop words: ", " ".join(most_prob_words)
+   	except:
+	    pass
+    '''
 
     Xtrain_idx = np.array(Xtrain_np[x_ind + offsets])
-    target = Variable(torch.cuda.FloatTensor(get_bow_encoding(Xtrain_idx, Lenseq[x_ind + offsets])))
+    target = Variable(t.FloatTensor(get_bow_encoding(Xtrain_idx, Lenseq[x_ind + offsets])))
     
-    if np.random.randint(0,100) == 5:
+    '''if np.random.randint(0,100) == 5:
 	print 'target and output vector comparison'
 	print target.data.cpu().numpy()[0]
 	print outputs.data.cpu().numpy()[0]
-    
+    '''
 
     loss = -(target*torch.log(outputs+1e-6) + (1-target)*torch.log(1-outputs+1e-6)).mean(1).mean(0)
     loss.backward()
@@ -287,8 +321,9 @@ for epoch in range(args.epochs):
     train_loss_avg+=loss.data[0]
     if epoch and epoch % 100 == 0:
         print epoch, train_loss_avg / 100.0
+	last_loss = train_loss_avg
         train_loss_avg = 0
-        
+
     if curr_acc > best_valid_acc:
 	print 'The model is saved'
         best_valid_acc = curr_acc
@@ -304,11 +339,21 @@ for epoch in range(args.epochs):
                 }, 'hierarchical_betta_' + d.isoformat() + '.pkl')
 
 
-print Counter(sampled_x)[0:50]
-
 hs1 = HierarchicalSent()
-hs1.cuda()
-optimizer = torch.optim.Adadelta(hs1.parameters(), lr=lr, rho=0.9)
+if torch.cuda.is_available():
+    hs1.cuda()
+
+parameters = filter(lambda p: p.requires_grad, hs1.parameters())
+
+if args.optimizer == "Adadelta":
+   optimizer = torch.optim.Adadelta(parameters, lr=lr, rho=0.9)
+
+if args.optimizer == "SGD":
+    optimizer = torch.optim.SGD(parameters, lr=0.01, momentum=0.9)
+
+if args.optimizer == "Adam":
+    optimizer =  torch.optim.Adam(parameters, lr=lr)
+
 d = date.today()
 args.model_filename = 'hierarchical_betta_' + d.isoformat() + '.pkl'
 
@@ -325,12 +370,17 @@ else:
 # finding the nearest neigbours in the dataset
 
 from sklearn.neighbors import KDTree
+import time
 
-writer = csv.writer(open('KNN_results_hierarchical_sent.csv','a'), delimiter=',', lineterminator='\n')
+d = time.strftime("%d.%m.%y-%H:%M:%S")
+writer = csv.writer(open('KNN_results_hierarchical_sent_' + d + '_.csv','w'), delimiter=',', lineterminator='\n')
+writer.writerow(('epochs','lr','K','Ntrain','voc_size'))
+writer.writerow((args.epochs, args.lr, args.K, Ntrain, voc_size))
+writer.writerow((args,))
 writer.writerow(('index_sample', 'index_closest_neighbour','sampled sentence','nearest neighbour sentence'))
-
 import scipy
 
+KNN_pairs = list()
 for K in range(0, args.K+1):
     print 'Level:', K
     writer.writerow(( ("Level:" + str(K))))	
@@ -338,11 +388,21 @@ for K in range(0, args.K+1):
     print 'MIN vector value:', np.min(hk)
     print 'MAX vector value:', np.max(hk)
     print 'MEAN vector value:', np.mean(hk)
-    print 'Sample vector:', hk[0,:]     
+    #print 'Sample vector:', hk[0,:]     
     kdt = KDTree(hk, leaf_size=30, metric='euclidean')
-    knn = kdt.query(hk, k=2, return_distance=False) 
-    for element in knn[0:20]:
+    knn = kdt.query(hk, k=2, return_distance=False)
+    K_pairs = set() 
+    for element in knn[1000:1200]:
+	K_pairs.add((element[0],element[1]))
+	#if K and (element[0],element[1]) not in KNN_pairs[K-1]: 
 	writer.writerow((element[0], element[1], scipy.spatial.distance.cosine(hk[element[0]],hk[element[1]]), bc.Xtrain[element[0]],  bc.Xtrain[element[1]]))
-        
+    KNN_pairs.append(K_pairs)
 
+for i in range(0, args.K+1):
+    for j in range(i+1, args.K+1):
+	print 'Level', i, ' and ', j, '# same neigbours out of 200:', len(KNN_pairs[i]&KNN_pairs[j])
+	writer.writerow(( 'Level', i , ' and ', j, ' have the same KNN (out of 200) :', len(KNN_pairs[i]&KNN_pairs[j]) ))
 
+res_table = csv.writer(open('results_comparison.csv','a+'), delimiter=',', lineterminator='\n')
+#res_table.writerow(('train_error','K', 'decoder_type','vocabulary size', 'epochs', 'training size', 'stop words', '# KNN between 0 and 1'))
+res_table.writerow((last_loss, args.K, args.decoder_form, voc_size,args.epochs, Ntrain, args.stop_words, len(KNN_pairs[0]&KNN_pairs[1]) ))
